@@ -1,8 +1,11 @@
 name: Build and publish SPHShore
 
+
 on:
+  workflow_dispatch:
   release:
     types: [published]
+
 
 permissions:
   contents: read
@@ -49,9 +52,13 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+
   publish:
+    if: github.event_name == 'release'
     name: Upload release to PyPI
     needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+
     runs-on: ubuntu-latest
     environment:
       name: pypi
