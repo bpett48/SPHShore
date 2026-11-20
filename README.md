@@ -1,9 +1,6 @@
 # SPHShore
 
 **SPHShore** is an early-stage, C++17-accelerated Python package for simulating water waves in a three-dimensional smoothed particle hydrodynamics (SPH) tank. It retains the original wave-tank solver, with a moving piston wavemaker, an inclined shoreline and two fixed vertical pillars (one submerged, one extending above the still-water level).
-
-> **Alpha software:** This is a research/development simulation, not a validated coastal engineering model. No model accuracy claims are made. Check timestep convergence, conservation, boundary handling and physical benchmarks before using numerical results for research or engineering decisions.
-
 ## Install locally
 
 Python 3.10+ and a C++17 compiler are required when building from source. On Windows, install Visual Studio Build Tools with the C++ workload; on Linux/macOS use a suitable C++ compiler.
