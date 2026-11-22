@@ -1,3 +1,4 @@
+
 """Python interface to the original C++17 SPHShore solver."""
 from __future__ import annotations
 
@@ -151,6 +152,35 @@ class WaveTank:
         """Return to the configured sinusoidal wave-maker motion."""
         self._check_open()
         _core.use_sinusoidal_piston(self._handle)
+
+    def add_propulsion(self, position, force) -> int:
+        """Apply a total force equally across water particles in one hash cell.
+
+        position: (X, Y, Z) coordinates in metres.
+        force: (FX, FY, FZ) total force in newtons.
+
+        The force is divided equally between the particles in the selected
+        cell and applied during the next simulation timestep.
+
+        Returns the number of particles receiving propulsion.
+        An empty cell returns zero.
+        """
+        self._check_open()
+
+        if len(position) != 3 or len(force) != 3:
+            raise ValueError("Position and force must each contain three values")
+
+        position = tuple(float(x) for x in position)
+        force = tuple(float(x) for x in force)
+
+        if not all(math.isfinite(x) for x in position + force):
+            raise ValueError("Position and force must contain finite values")
+
+        return _core.add_propulsion(
+            self._handle,
+            position[0], position[1], position[2],
+            force[0], force[1], force[2]
+        )
 
     def outputMap(self) -> np.ndarray:
         """Return an (M,7) NumPy array of occupied hash cells.

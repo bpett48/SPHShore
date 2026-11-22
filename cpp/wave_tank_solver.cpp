@@ -2,25 +2,19 @@
 //This version has a moving piston, a sloping shoreline and two fixed cylindrical pillars
 //One pillar is submerged and the other goes above water
 //The fluid uses a 3D cubic spline kernel, density diffusion and artificial viscosity
-//The logbook stuff is only used for testing
-//Currently in the prosses of making it into a python library, also needs a clean up
+//The simulation is called through the SPHShore python library
 //I have added a bunch of stuff to throw an error if there are invalid values
-//There is also a few functions that the are never called in this version, ill find them in a new version
 
 #include <iostream>
-#include <fstream>
 #include <vector>
 #include <cmath>
 #include <algorithm>
 #include <stdexcept>
-#include <iomanip>
-#include <chrono>
 #include <random>
 #include <string>
 #include <limits>
 #include <cstdint>
 #include <memory>
-#include <cstring>
 using namespace std;
 struct Vector
 {
@@ -38,14 +32,9 @@ struct Pillar
 };
 struct parameters
 {//Some of this is overwritten when executed
-    //These settings control the detail and duration of the simulation
-    bool WriteFiles = true;
+    //These settings control the detail and time step of the simulation
     int N = 12000;
-    int Iterations = 50000;
     double TimeStep = 0.00010;
-    double SaveEveryTime = 0.025;
-    double DiagnosticsEveryTime = 0.5;
-    double MaxRunHours = 2.8;
     unsigned int RandomSeed = 42069;
 
     //Dimentions of envionment
@@ -92,7 +81,6 @@ struct parameters
     Pillar UnderwaterPillar = { 0.30, 0.145, 0.045, 0.075 };
     Pillar AboveWaterPillar = { 0.48, 0.305, 0.045, 0.190 };
 };
-
 void ConfigureGeometry(parameters& Par)
 {
     //I have a max and minimum geometory, the minimum is always (0,0,0) but ill leave it in
@@ -110,8 +98,8 @@ void ConfigureGeometry(parameters& Par)
     Par.RampAngle = atan(tan(16.0 * Par.Pi / 180.0) * SZ / SX) * 180.0 / Par.Pi;
     Par.PistonBaseX = Par.MinDimmensions.X + 0.03 * SX;
     Par.PistonAmplitude = 0.007 * SX;
-    Par.UnderwaterPillar = {Par.MinDimmensions.X + 0.30 * SX,Par.MinDimmensions.Y + 0.145 * SY, 0.045 * SR, 0.075 * SZ};
-    Par.AboveWaterPillar = {Par.MinDimmensions.X + 0.48 * SX,Par.MinDimmensions.Y + 0.305 * SY,0.045 * SR, 0.190 * SZ};
+    Par.UnderwaterPillar = { Par.MinDimmensions.X + 0.30 * SX,Par.MinDimmensions.Y + 0.145 * SY, 0.045 * SR, 0.075 * SZ };
+    Par.AboveWaterPillar = { Par.MinDimmensions.X + 0.48 * SX,Par.MinDimmensions.Y + 0.305 * SY,0.045 * SR, 0.190 * SZ };
 }
 Vector DisplacmentOfVectors(Vector A, Vector B)
 {
@@ -136,7 +124,7 @@ double GetRampDistance(Vector Position, const parameters& Par)
     return (Position.X - Par.RampStartX) * Normal.X + (Position.Z - Par.MinDimmensions.Z) * Normal.Z;
 }
 double GetWaveEnvelope(double Time, const parameters& Par)
-{
+{//How fast the piston starts (weird stuff if without)
     if (Time <= Par.WaveStartTime)
     {
         return 0.0;
@@ -150,7 +138,7 @@ double GetWaveEnvelope(double Time, const parameters& Par)
 }
 double GetWaveEnvelopeRate(double Time, const parameters& Par)
 {
-    if (Time <= Par.WaveStartTime || Par.WaveRampTime <= 0.0 ||Time >= Par.WaveStartTime + Par.WaveRampTime)
+    if (Time <= Par.WaveStartTime || Par.WaveRampTime <= 0.0 || Time >= Par.WaveStartTime + Par.WaveRampTime)
     {
         return 0.0;
     }
@@ -159,7 +147,7 @@ double GetWaveEnvelopeRate(double Time, const parameters& Par)
 }
 double GetPistonPosition(double Time, const parameters& Par)
 {
-    if (Par.UseCustomPiston) 
+    if (Par.UseCustomPiston)
         return Par.CustomPistonPosition;
     double Phase = 2.0 * Par.Pi * Par.WaveFrequency * (Time - Par.WaveStartTime);
     return Par.PistonBaseX + Par.PistonAmplitude * GetWaveEnvelope(Time, Par) * sin(Phase);
@@ -180,13 +168,11 @@ bool IsInsidePillar(Vector Position, const Pillar& Obstacle, const parameters& P
 bool IsValidWaterPosition(Vector Position, const parameters& Par)
 {//More boundry stuff
     return Position.X > Par.PistonBaseX && Position.X < Par.MaxDimmensions.X && Position.Y > Par.MinDimmensions.Y && Position.Y < Par.MaxDimmensions.Y &&
-        Position.Z > GetRampHeight(Position.X, Par) && Position.Z < Par.WaterLevel &&
-        !IsInsidePillar(Position, Par.UnderwaterPillar, Par) &&
-        !IsInsidePillar(Position, Par.AboveWaterPillar, Par);
+        Position.Z > GetRampHeight(Position.X, Par) && Position.Z < Par.WaterLevel && !IsInsidePillar(Position, Par.UnderwaterPillar, Par) && !IsInsidePillar(Position, Par.AboveWaterPillar, Par);
 }
 double GetPressure(double Density, const parameters& Par)
 {
-    //Tait equation of state; negative pressure is disabled
+    //Tait equation of state (no negtive pressure)
     double B = Par.ReferenceDensity * Par.SoundSpeed * Par.SoundSpeed / Par.Gamma;
     return max(0.0, B * (pow(Density / Par.ReferenceDensity, Par.Gamma) - 1.0));
 }
@@ -231,6 +217,7 @@ struct Particle
     Vector Position;
     Vector Velocity;
     Vector Acceleration;
+    Vector ExternalForce;
     Vector XSPH;
     double Density = 1000.0;
     double Pressure = 0.0;
@@ -309,27 +296,39 @@ struct MapVector
     int ParticleCount = 0;
 };
 
-int AddPropulsion(Vector Position, Vector Force, vector<Particle>& Population, const SpatialGrid& Grid, const parameters& Par)
-{//This fuction applies a force to each partcle in a cell (direction of force is included). This is from the fish movment
-    const Cell C = Grid.GetCell(Position);
-    if (!Grid.IsInside(C)) { return 0; }
-    if (!isfinite(Force.X) || !isfinite(Force.Y) || !isfinite(Force.Z) ||
-        Par.ParticleMass <= 0.0) { throw runtime_error("Invalid propulsion force or mass"); }
-    const auto& Indices = Grid.Cells[Grid.GetIndex(C)];
+int AddPropulsion(Vector Position, Vector Force, vector<Particle>& Population, const SpatialGrid& Grid)
+{//This function divides the specified force evenly between all water particles in the cell
+    //There must be particles in the spesifed cell
+    if (!isfinite(Position.X) || !isfinite(Position.Y) || !isfinite(Position.Z) || !isfinite(Force.X) || !isfinite(Force.Y) || !isfinite(Force.Z))
+        throw runtime_error("Invalid propulsion position or force");
+
+    Cell CellPosition = Grid.GetCell(Position);
+    if (!Grid.IsInside(CellPosition))
+        return 0;
+
+    const auto& Indices = Grid.Cells[Grid.GetIndex(CellPosition)];
     int Count = 0;
-    for (int I : Indices)
+    for (int Index : Indices)
     {
-        if (I >= 0 && I < (int)Population.size() && !Population[I].IsBoundary)
-            ++Count;
+        if (Index < 0 || Index >= (int)Population.size() || Population[Index].IsBoundary)
+            continue;
+        ++Count;
     }
-    if (Count == 0) { return 0; }
-    const double Factor = 1.0 / (Par.ParticleMass * Count);
-    for (int I : Indices)
+    if (Count == 0)
+        return 0;
+
+    //Each particle receives an equal share of the total requested force
+    Vector ForcePerParticle = { Force.X / Count, Force.Y / Count, Force.Z / Count };
+    for (int Index : Indices)
     {
-        if (I < 0 || I >= (int)Population.size() || Population[I].IsBoundary) { continue; }
-        Population[I].Acceleration.X += Force.X * Factor;
-        Population[I].Acceleration.Y += Force.Y * Factor;
-        Population[I].Acceleration.Z += Force.Z * Factor;
+        if (Index < 0 || Index >= (int)Population.size() || Population[Index].IsBoundary)
+            continue;
+
+        Particle& P = Population[Index];
+        Vector NewForce = { P.ExternalForce.X + ForcePerParticle.X, P.ExternalForce.Y + ForcePerParticle.Y, P.ExternalForce.Z + ForcePerParticle.Z };
+        if (!isfinite(NewForce.X) || !isfinite(NewForce.Y) || !isfinite(NewForce.Z))
+            throw runtime_error("Propulsion force exceeds finite range");
+        P.ExternalForce = NewForce;
     }
     return Count;
 }
@@ -339,48 +338,48 @@ vector<MapVector> outputMap(const vector<Particle>& Population, const SpatialGri
     //This function contains a lot of spaggeti code
     vector<MapVector> Result;
     for (int Z = 0; Z < Grid.NZ; ++Z)
-    for (int Y = 0; Y < Grid.NY; ++Y)
-    for (int X = 0; X < Grid.NX; ++X)
-    {
-        Cell C{ X, Y, Z };
-        const auto& Indices = Grid.Cells[Grid.GetIndex(C)];
-        if (Indices.empty())
-        {
-            continue;
-        }
-        MapVector Sample;
-        for (int I : Indices)
-        {
-            if (I < 0 || I >= (int)Population.size() || Population[I].IsBoundary)
-                continue;
-            const Vector V = Population[I].Velocity;
-            Sample.Velocity.X += V.X;
-            Sample.Velocity.Y += V.Y;
-            Sample.Velocity.Z += V.Z;
-            ++Sample.ParticleCount;
-        }
-        if (Sample.ParticleCount == 0)
-        {
-            continue;
-        }
-        const double Inv = 1.0 / Sample.ParticleCount;
-        Sample.Velocity.X *= Inv;
-        Sample.Velocity.Y *= Inv;
-        Sample.Velocity.Z *= Inv;
-        Sample.Position = {Grid.Origin.X + (X + 0.5) * Grid.CellSize,Grid.Origin.Y + (Y + 0.5) * Grid.CellSize,Grid.Origin.Z + (Z + 0.5) * Grid.CellSize};
-        Result.push_back(Sample);
-    }
+        for (int Y = 0; Y < Grid.NY; ++Y)
+            for (int X = 0; X < Grid.NX; ++X)
+            {
+                Cell C{ X, Y, Z };
+                const auto& Indices = Grid.Cells[Grid.GetIndex(C)];
+                if (Indices.empty())
+                {
+                    continue;
+                }
+                MapVector Sample;
+                for (int I : Indices)
+                {
+                    if (I < 0 || I >= (int)Population.size() || Population[I].IsBoundary)
+                        continue;
+                    const Vector V = Population[I].Velocity;
+                    Sample.Velocity.X += V.X;
+                    Sample.Velocity.Y += V.Y;
+                    Sample.Velocity.Z += V.Z;
+                    ++Sample.ParticleCount;
+                }
+                if (Sample.ParticleCount == 0)
+                {
+                    continue;
+                }
+                const double Inv = 1.0 / Sample.ParticleCount;
+                Sample.Velocity.X *= Inv;
+                Sample.Velocity.Y *= Inv;
+                Sample.Velocity.Z *= Inv;
+                Sample.Position = { Grid.Origin.X + (X + 0.5) * Grid.CellSize,Grid.Origin.Y + (Y + 0.5) * Grid.CellSize,Grid.Origin.Z + (Z + 0.5) * Grid.CellSize };
+                Result.push_back(Sample);
+            }
     return Result;
 }
-void AddMirrorParticle(const Particle& P, vector<Particle>& BoundaryParticles,Vector MirrorPosition, Vector MirrorVelocity, const parameters& Par)
+void AddMirrorParticle(const Particle& P, vector<Particle>& BoundaryParticles, Vector MirrorPosition, Vector MirrorVelocity, const parameters& Par)
 {//even more boundry stuff
     double MirrorPressure = P.Pressure + Par.ReferenceDensity * Par.GravAccelaration * (MirrorPosition.Z - P.Position.Z);
     MirrorPressure = max(0.0, MirrorPressure);
-    BoundaryParticles.emplace_back(-1, MirrorPosition, MirrorVelocity,GetDensityFromPressure(MirrorPressure, Par), true);
+    BoundaryParticles.emplace_back(-1, MirrorPosition, MirrorVelocity, GetDensityFromPressure(MirrorPressure, Par), true);
     BoundaryParticles.back().Pressure = MirrorPressure;
 }
-void AddPillarBoundaryParticles(const Particle& P, const Pillar& Obstacle,vector<Particle>& BoundaryParticles, const parameters& Par)
-{//pillars are a more complex surface than the walls so i have done it this way
+void AddPillarBoundaryParticles(const Particle& P, const Pillar& Obstacle, vector<Particle>& BoundaryParticles, const parameters& Par)
+{//pillars are a more complex surface than the walls so i have done it a bit different to earlier boundry stuff
     double Support = 2.0 * Par.SmoothingLength;
     double DX = P.Position.X - Obstacle.X;
     double DY = P.Position.Y - Obstacle.Y;
@@ -403,7 +402,7 @@ void AddPillarBoundaryParticles(const Particle& P, const Pillar& Obstacle,vector
         AddMirrorParticle(P, BoundaryParticles, Mirror, MirrorVelocity, Par);
     }
 }
-void CreateBoundaryParticles(const vector<Particle>& Population,vector<Particle>& BoundaryParticles, double Time, const parameters& Par)
+void CreateBoundaryParticles(const vector<Particle>& Population, vector<Particle>& BoundaryParticles, double Time, const parameters& Par)
 {//Placing boundry particles
     BoundaryParticles.clear();
     double Support = 2.0 * Par.SmoothingLength;
@@ -464,7 +463,7 @@ void CreateBoundaryParticles(const vector<Particle>& Population,vector<Particle>
         AddPillarBoundaryParticles(P, Par.AboveWaterPillar, BoundaryParticles, Par);
     }
 }
-void CalculateTotalForce(vector<Particle>& Population,const vector<Particle>& BoundaryParticles, const SpatialGrid& Grid,const parameters& Par)
+void CalculateTotalForce(vector<Particle>& Population, const vector<Particle>& BoundaryParticles, const SpatialGrid& Grid, const parameters& Par)
 {
     //Calculate pressure, artificial viscosity, continuity and XSPH smoothing
     //parralel used here
@@ -474,82 +473,88 @@ void CalculateTotalForce(vector<Particle>& Population,const vector<Particle>& Bo
     for (int i = 0; i < ParticleCount; i++)
     {
         Particle& P = Population[i];
-        P.Acceleration = { 0.0, 0.0, Par.GravAccelaration };
+        //Add externally requested forces AFTER resetting the SPH acceleration.
+        //Force is per particle (newtons), so convert it to acceleration.
+        P.Acceleration = {
+            P.ExternalForce.X / Par.ParticleMass,
+            P.ExternalForce.Y / Par.ParticleMass,
+            Par.GravAccelaration + P.ExternalForce.Z / Par.ParticleMass
+        };
         P.DensityRate = 0.0;
         P.XSPH = {};
         Cell C = Grid.GetCell(P.Position);
 
         for (int X = -1; X <= 1; X++)
-        for (int Y = -1; Y <= 1; Y++)
-        for (int Z = -1; Z <= 1; Z++)
-        {
-            Cell SearchCell = { C.X + X, C.Y + Y, C.Z + Z };
-            if (!Grid.IsInside(SearchCell))
-            {
-                continue;
-            }
-            for (int Index : Grid.Cells[Grid.GetIndex(SearchCell)])
-            {
-                if (Index == i)
+            for (int Y = -1; Y <= 1; Y++)
+                for (int Z = -1; Z <= 1; Z++)
                 {
-                    continue;
-                }
-                const Particle& Neighbor = Index < ParticleCount ? Population[Index] : BoundaryParticles[Index - ParticleCount];
-                Vector R = DisplacmentOfVectors(P.Position, Neighbor.Position);
-                double R2 = R.X * R.X + R.Y * R.Y + R.Z * R.Z;
-                if (R2 < 1e-24 || R2 >= 4.0 * H2)
-                {
-                    continue;
-                }
+                    Cell SearchCell = { C.X + X, C.Y + Y, C.Z + Z };
+                    if (!Grid.IsInside(SearchCell))
+                    {
+                        continue;
+                    }
+                    for (int Index : Grid.Cells[Grid.GetIndex(SearchCell)])
+                    {
+                        if (Index == i)
+                        {
+                            continue;
+                        }
+                        const Particle& Neighbor = Index < ParticleCount ? Population[Index] : BoundaryParticles[Index - ParticleCount];
+                        Vector R = DisplacmentOfVectors(P.Position, Neighbor.Position);
+                        double R2 = R.X * R.X + R.Y * R.Y + R.Z * R.Z;
+                        if (R2 < 1e-24 || R2 >= 4.0 * H2)
+                        {
+                            continue;
+                        }
 
-                double Distance = sqrt(R2);
-                Vector Grad = CSKernelGradient(R, Distance, Par);
-                Vector DV = DisplacmentOfVectors(P.Velocity, Neighbor.Velocity);
-                double DotVG = DV.X * Grad.X + DV.Y * Grad.Y + DV.Z * Grad.Z;
-                double DotVR = DV.X * R.X + DV.Y * R.Y + DV.Z * R.Z;
-                //The continuity equation and density diffusion
-                P.DensityRate += Par.ParticleMass * DotVG;
-                if (!Neighbor.IsBoundary)
-                {
-                    double DotRG = R.X * Grad.X + R.Y * Grad.Y + R.Z * Grad.Z;
-                    P.DensityRate += -Par.DensityDiffusion * Par.SmoothingLength *Par.SoundSpeed * (Par.ParticleMass / Neighbor.Density) * 2.0 *(Neighbor.Density - P.Density) * DotRG / (R2 + 0.01 * H2);
-                }
-                double FullConstant = Par.ParticleMass *(P.Pressure / (P.Density * P.Density) +Neighbor.Pressure / (Neighbor.Density * Neighbor.Density));
-                if (DotVR < 0.0)
-                {
-                    double Mu = Par.SmoothingLength * DotVR / (R2 + 0.01 * H2);
-                    double MeanDensity = 0.5 * (P.Density + Neighbor.Density);
-                    FullConstant += Par.ParticleMass *(-Par.ArtificialViscosity * Par.SoundSpeed * Mu / MeanDensity);
-                }
+                        double Distance = sqrt(R2);
+                        Vector Grad = CSKernelGradient(R, Distance, Par);
+                        Vector DV = DisplacmentOfVectors(P.Velocity, Neighbor.Velocity);
+                        double DotVG = DV.X * Grad.X + DV.Y * Grad.Y + DV.Z * Grad.Z;
+                        double DotVR = DV.X * R.X + DV.Y * R.Y + DV.Z * R.Z;
+                        //The continuity equation and density diffusion
+                        P.DensityRate += Par.ParticleMass * DotVG;
+                        if (!Neighbor.IsBoundary)
+                        {
+                            double DotRG = R.X * Grad.X + R.Y * Grad.Y + R.Z * Grad.Z;
+                            P.DensityRate += -Par.DensityDiffusion * Par.SmoothingLength * Par.SoundSpeed * (Par.ParticleMass / Neighbor.Density) * 2.0 * (Neighbor.Density - P.Density) * DotRG / (R2 + 0.01 * H2);
+                        }
+                        double FullConstant = Par.ParticleMass * (P.Pressure / (P.Density * P.Density) + Neighbor.Pressure / (Neighbor.Density * Neighbor.Density));
+                        if (DotVR < 0.0)
+                        {
+                            double Mu = Par.SmoothingLength * DotVR / (R2 + 0.01 * H2);
+                            double MeanDensity = 0.5 * (P.Density + Neighbor.Density);
+                            FullConstant += Par.ParticleMass * (-Par.ArtificialViscosity * Par.SoundSpeed * Mu / MeanDensity);
+                        }
 
-                P.Acceleration.X -= FullConstant * Grad.X;
-                P.Acceleration.Y -= FullConstant * Grad.Y;
-                P.Acceleration.Z -= FullConstant * Grad.Z;
+                        P.Acceleration.X -= FullConstant * Grad.X;
+                        P.Acceleration.Y -= FullConstant * Grad.Y;
+                        P.Acceleration.Z -= FullConstant * Grad.Z;
 
-                if (!Neighbor.IsBoundary)
-                {
-                    double Weight = Par.XSPHFactor * (Par.ParticleMass / Neighbor.Density) * CSKernel(Distance, Par);
-                    P.XSPH.X -= DV.X * Weight;
-                    P.XSPH.Y -= DV.Y * Weight;
-                    P.XSPH.Z -= DV.Z * Weight;
+                        if (!Neighbor.IsBoundary)
+                        {
+                            double Weight = Par.XSPHFactor * (Par.ParticleMass / Neighbor.Density) * CSKernel(Distance, Par);
+                            P.XSPH.X -= DV.X * Weight;
+                            P.XSPH.Y -= DV.Y * Weight;
+                            P.XSPH.Z -= DV.Z * Weight;
+                        }
+                    }
                 }
-            }
-        }
     }
 }
 void RemoveIncomingNormalVelocity(Particle& P, Vector Normal, double WallNormalVelocity, const parameters& Par)
-{
-    double Relative = P.Velocity.X * Normal.X +
-        P.Velocity.Y * Normal.Y + P.Velocity.Z * Normal.Z - WallNormalVelocity;
+{//Stops particles moving into a wall but they can move along it
+    double Relative = P.Velocity.X * Normal.X + P.Velocity.Y * Normal.Y + P.Velocity.Z * Normal.Z - WallNormalVelocity;
     if (Relative < 0.0)
     {
         double Correction = (1.0 + Par.WallRestitution) * Relative;
+        //value controls the bounce
         P.Velocity.X -= Correction * Normal.X;
         P.Velocity.Y -= Correction * Normal.Y;
         P.Velocity.Z -= Correction * Normal.Z;
     }
 }
-void ReflectPillar(Particle& P, const Pillar& Obstacle,const parameters& Par, double Clearance)
+void ReflectPillar(Particle& P, const Pillar& Obstacle, const parameters& Par, double Clearance)
 {//pillar interaction (talller pillar does not need roof
     const double Top = Par.MinDimmensions.Z + Obstacle.Height;
     double DX = P.Position.X - Obstacle.X;
@@ -585,7 +590,7 @@ void ReflectParticle(Particle& P, double Time, const parameters& Par)
     double Left = GetPistonPosition(Time, Par);
     double LeftVelocity = GetPistonVelocity(Time, Par);
 
-    if (!isfinite(P.Position.X) || !isfinite(P.Position.Y) || !isfinite(P.Position.Z) || !isfinite(P.Velocity.X) || !isfinite(P.Velocity.Y) || !isfinite(P.Velocity.Z))throw runtime_error("Non-finite particle before boundary correction, ID=" +to_string(P.ID));
+    if (!isfinite(P.Position.X) || !isfinite(P.Position.Y) || !isfinite(P.Position.Z) || !isfinite(P.Velocity.X) || !isfinite(P.Velocity.Y) || !isfinite(P.Velocity.Z))throw runtime_error("Non-finite particle before boundary correction, ID=" + to_string(P.ID));
 
     //Clip the horizontal tank footprint, removing only incoming velocity.
     if (P.Position.X < Left + Epsilon)
@@ -653,23 +658,12 @@ void ReflectParticle(Particle& P, double Time, const parameters& Par)
             ". Inspect time step / velocities / geometry.");
     }
 }
-void SaveParticles(ofstream& SFile, const vector<Particle>& Population,int Iteration, double Time)
-{//This part is used for testing and probably wont be used in the final product
-    //there is a bool in parameters that can toggle it
-    for (const Particle& P : Population)
-    {
-        SFile << Iteration << "," << Time << "," << P.ID << "," <<
-            P.Position.X << "," << P.Position.Y << "," << P.Position.Z << "," <<
-            P.Velocity.X << "," << P.Velocity.Y << "," << P.Velocity.Z << "," <<
-            P.Density << "," << P.Pressure << "\n";
-    }
-}
 int CountInitialParticles(double Spacing, const parameters& Par, int StopAfter)
 {//Checks for valid particle positions (cylinders are empty)
     int Count = 0;
     for (double Z = Par.MinDimmensions.Z + 0.5 * Spacing; Z < Par.WaterLevel - 0.25 * Spacing; Z += Spacing)
     {
-        for (double Y = Par.MinDimmensions.Y + 0.5 * Spacing;Y < Par.MaxDimmensions.Y - 0.5 * Spacing; Y += Spacing)
+        for (double Y = Par.MinDimmensions.Y + 0.5 * Spacing; Y < Par.MaxDimmensions.Y - 0.5 * Spacing; Y += Spacing)
         {
             for (double X = Par.PistonBaseX + 0.5 * Spacing; X < Par.MaxDimmensions.X - 0.5 * Spacing; X += Spacing)
             {
@@ -702,10 +696,10 @@ double GetParticleSpacing(const parameters& Par)
     double Volume = Width * (Height * (WetEnd - Par.PistonBaseX) - 0.5 * Gradient * InclinedLength * InclinedLength);
 
     auto SubmergedCylinderVolume = [&](const Pillar& Obstacle)
-    {
-        double SubmergedHeight = min(Height, Obstacle.Height);
-        return Par.Pi * Obstacle.Radius * Obstacle.Radius * SubmergedHeight;
-    };
+        {
+            double SubmergedHeight = min(Height, Obstacle.Height);
+            return Par.Pi * Obstacle.Radius * Obstacle.Radius * SubmergedHeight;
+        };
     Volume -= SubmergedCylinderVolume(Par.UnderwaterPillar);
     Volume -= SubmergedCylinderVolume(Par.AboveWaterPillar);
     if (Volume <= 0.0)
@@ -758,8 +752,7 @@ void ValidateParameters(const parameters& Par)
     if (Par.N <= 0 || Par.TimeStep <= 0.0 ||
         Par.SoundSpeed <= 0.0 || Par.ReferenceDensity <= 0.0 ||
         Par.Gamma <= 0.0 || Par.SmoothingLengthFactor <= 0.0 ||
-        Par.SaveEveryTime < 0.0 || Par.DiagnosticsEveryTime < 0.0 ||
-        Par.MaxRunHours < 0.0 || Par.PistonAmplitude < 0.0 ||
+        Par.PistonAmplitude < 0.0 ||
         Par.WaveFrequency < 0.0 || Par.WaveStartTime < 0.0 || Par.WaveRampTime < 0.0 ||
         Par.MaxDimmensions.X <= Par.MinDimmensions.X ||
         Par.MaxDimmensions.Y <= Par.MinDimmensions.Y ||
@@ -813,18 +806,19 @@ struct WT_Config
     double SoundSpeed, SmoothingLengthFactor;
     double DensityDiffusion, ArtificialViscosity, XSPHFactor;
     unsigned int RandomSeed;
+    //Kept only for compatibility with the existing Python bindings; no files are written.
     int WriteFiles;
     double SaveEveryTime;
 };
 struct WT_MapRow
 {
-    double X,Y,Z,VX,VY,VZ;
+    double X, Y, Z, VX, VY, VZ;
     int Count;
 };
 struct WT_ParticleRow
 {
     int ID;
-    double X,Y,Z,VX,VY,VZ,Density,Pressure;
+    double X, Y, Z, VX, VY, VZ, Density, Pressure;
 };
 struct WT_Info
 {
@@ -839,28 +833,28 @@ struct WaveTank
     vector<Particle> BoundaryParticles;
     vector<Particle> AllParticles;
     unique_ptr<SpatialGrid> Grid;
-    ofstream SFile;
     uint64_t Iteration = 0;
     double Time = 0.0;
-    double NextSave = 0.0;
+
+    int ApplyPropulsion(Vector Position, Vector Force)
+    {//Use the spatial hashing grid at the current particle positions
+        Grid->Build(Population);
+        return AddPropulsion(Position, Force, Population, *Grid);
+    }
 
     explicit WaveTank(const WT_Config& C)
-    {
+    {//Everything is in base si units (particles are a bit different to approximate)
         Par.N = C.N;
         Par.TimeStep = C.TimeStep;
-        Par.MinDimmensions = {C.MinX,C.MinY,C.MinZ};
-        Par.MaxDimmensions = {C.MaxX,C.MaxY,C.MaxZ};
+        Par.MinDimmensions = { C.MinX,C.MinY,C.MinZ };
+        Par.MaxDimmensions = { C.MaxX,C.MaxY,C.MaxZ };
         Par.SoundSpeed = C.SoundSpeed;
         Par.SmoothingLengthFactor = C.SmoothingLengthFactor;
         Par.DensityDiffusion = C.DensityDiffusion;
         Par.ArtificialViscosity = C.ArtificialViscosity;
         Par.XSPHFactor = C.XSPHFactor;
         Par.RandomSeed = C.RandomSeed;
-        Par.WriteFiles = C.WriteFiles != 0;
-        Par.SaveEveryTime = C.SaveEveryTime;
         ConfigureGeometry(Par);
-        //The piston coordinates are supplied in METRES; they are not reset by
-        //ConfigureGeometry. Python defaults to proportional scaled values.
         Par.PistonBaseX = C.PistonBaseX;
         Par.PistonAmplitude = C.PistonAmplitude;
         Par.WaveFrequency = C.WaveFrequency;
@@ -875,130 +869,75 @@ struct WaveTank
             throw runtime_error("TimeStep exceeds CFL safety bound " + to_string(MaximumTimeStep));
 
         vector<Vector> InitialPositions;
-        InitialPositions.reserve((size_t)Par.N + Par.N/10);
+        InitialPositions.reserve((size_t)Par.N + Par.N / 10);
         const double dx = Par.ParticleSpacing;
-        for (double Z = Par.MinDimmensions.Z + 0.5*dx;
-                    Z < Par.WaterLevel - 0.25*dx; Z += dx)
-        for (double Y = Par.MinDimmensions.Y + 0.5*dx;
-                    Y < Par.MaxDimmensions.Y - 0.5*dx; Y += dx)
-        for (double X = Par.PistonBaseX + 0.5*dx;
-                    X < Par.MaxDimmensions.X - 0.5*dx; X += dx)
+        for (double Z = Par.MinDimmensions.Z + 0.5 * dx;
+            Z < Par.WaterLevel - 0.25 * dx; Z += dx)
+            for (double Y = Par.MinDimmensions.Y + 0.5 * dx;
+                Y < Par.MaxDimmensions.Y - 0.5 * dx; Y += dx)
+                for (double X = Par.PistonBaseX + 0.5 * dx;
+                    X < Par.MaxDimmensions.X - 0.5 * dx; X += dx)
         {
-            Vector Position{X,Y,Z};
-            if (Z < GetRampHeight(X,Par) + 0.5*dx ||
-                IsInsidePillar(Position,Par.UnderwaterPillar,Par) ||
-                IsInsidePillar(Position,Par.AboveWaterPillar,Par)) continue;
+            Vector Position{ X,Y,Z };
+            if (Z < GetRampHeight(X, Par) + 0.5 * dx ||
+                IsInsidePillar(Position, Par.UnderwaterPillar, Par) ||
+                IsInsidePillar(Position, Par.AboveWaterPillar, Par)) continue;
             InitialPositions.push_back(Position);
         }
         if (InitialPositions.size() < (size_t)Par.N)
             throw runtime_error("Not enough valid initial fluid positions");
         mt19937 Generator(Par.RandomSeed);
-        shuffle(InitialPositions.begin(),InitialPositions.end(),Generator);
-        uniform_real_distribution<double> Jitter(-Par.InitialJitter*dx,Par.InitialJitter*dx);
+        shuffle(InitialPositions.begin(), InitialPositions.end(), Generator);
+        uniform_real_distribution<double> Jitter(-Par.InitialJitter * dx, Par.InitialJitter * dx);
         Population.reserve(Par.N);
-        for (int i=0;i<Par.N;i++)
+        for (int i = 0; i < Par.N; i++)
         {
-            Vector P=InitialPositions[(size_t)i];
-            Vector Candidate{P.X+Jitter(Generator),P.Y+Jitter(Generator),P.Z+Jitter(Generator)};
-            if (Candidate.X > Par.PistonBaseX + 0.25*dx &&
-                Candidate.X < Par.MaxDimmensions.X - 0.25*dx &&
-                Candidate.Y > Par.MinDimmensions.Y + 0.25*dx &&
-                Candidate.Y < Par.MaxDimmensions.Y - 0.25*dx &&
-                Candidate.Z > GetRampHeight(Candidate.X,Par) + 0.25*dx &&
-                Candidate.Z < Par.WaterLevel - 0.05*dx &&
-                !IsInsidePillar(Candidate,Par.UnderwaterPillar,Par) &&
-                !IsInsidePillar(Candidate,Par.AboveWaterPillar,Par)) P=Candidate;
-            double Pressure=Par.ReferenceDensity*(-Par.GravAccelaration)*(Par.WaterLevel-P.Z);
-            Population.emplace_back(i,P,Vector{},GetDensityFromPressure(Pressure,Par));
-            Population.back().Pressure=Pressure;
+            Vector P = InitialPositions[(size_t)i];
+            Vector Candidate{ P.X + Jitter(Generator),P.Y + Jitter(Generator),P.Z + Jitter(Generator) };
+            if (Candidate.X > Par.PistonBaseX + 0.25 * dx && Candidate.X < Par.MaxDimmensions.X - 0.25 * dx && Candidate.Y > Par.MinDimmensions.Y + 0.25 * dx && Candidate.Y < Par.MaxDimmensions.Y - 0.25 * dx && Candidate.Z > GetRampHeight(Candidate.X, Par) + 0.25 * dx && Candidate.Z < Par.WaterLevel - 0.05 * dx &&!IsInsidePillar(Candidate, Par.UnderwaterPillar, Par) && !IsInsidePillar(Candidate, Par.AboveWaterPillar, Par)) P = Candidate;
+            double Pressure = Par.ReferenceDensity * (-Par.GravAccelaration) * (Par.WaterLevel - P.Z);
+            Population.emplace_back(i, P, Vector{}, GetDensityFromPressure(Pressure, Par));
+            Population.back().Pressure = Pressure;
         }
-        Grid=make_unique<SpatialGrid>(Par);
-        BoundaryParticles.reserve(Population.size()*6);
-        AllParticles.reserve(Population.size()*7);
-        NextSave=Par.SaveEveryTime;
-        if (Par.WriteFiles)
-        {
-            SFile.open("LogBook.txt");
-            if (!SFile) throw runtime_error("Cannot open LogBook.txt");
-            SFile << "Iteration,Time,ID,XPos,YPos,ZPos,XVel,YVel,ZVel,Density,Pressure\n" << setprecision(15);
-            ofstream F("SimulationConfig.txt");
-            if (!F) throw runtime_error("Cannot open SimulationConfig.txt");
-            F << setprecision(15) << "Parameter,Value\n";
-            auto Out=[&](const string& K,double V){ F << K << "," << V << "\n"; };
-            Out("TankLength",Par.MaxDimmensions.X-Par.MinDimmensions.X);
-            Out("TankWidth",Par.MaxDimmensions.Y-Par.MinDimmensions.Y);
-            Out("TankHeight",Par.MaxDimmensions.Z-Par.MinDimmensions.Z);
-            Out("MinX",Par.MinDimmensions.X);
-            Out("MinY",Par.MinDimmensions.Y);
-            Out("MinZ",Par.MinDimmensions.Z);
-            Out("WaterLevel",Par.WaterLevel);
-            Out("RampStartX",Par.RampStartX);
-            Out("RampAngle",Par.RampAngle);
-            Out("PistonBaseX",Par.PistonBaseX);
-            Out("PistonAmplitude",Par.PistonAmplitude);
-            Out("WaveFrequency",Par.WaveFrequency);
-            Out("WaveStartTime",Par.WaveStartTime);
-            Out("WaveRampTime",Par.WaveRampTime);
-            Out("Pillar1X",Par.UnderwaterPillar.X);
-            Out("Pillar1Y",Par.UnderwaterPillar.Y);
-            Out("Pillar1Radius",Par.UnderwaterPillar.Radius);
-            Out("Pillar1Height",Par.UnderwaterPillar.Height);
-            Out("Pillar2X",Par.AboveWaterPillar.X);
-            Out("Pillar2Y",Par.AboveWaterPillar.Y);
-            Out("Pillar2Radius",Par.AboveWaterPillar.Radius);
-            Out("Pillar2Height",Par.AboveWaterPillar.Height);
-            Out("ParticleSpacing",Par.ParticleSpacing);
-            Out("ParticleCount",Par.N);
-            Out("TimeStep",Par.TimeStep);
-            F.close();
-            SaveParticles(SFile,Population,0,0.0);
-        }
+        Grid = make_unique<SpatialGrid>(Par);
+        BoundaryParticles.reserve(Population.size() * 6);
+        AllParticles.reserve(Population.size() * 7);
+
     }
 
-    //No fixed end iteration. uint64_t counters are practically unbounded for
-    //real simulation durations; Python may call Step repeatedly.
+    //No max iteration count
     void Step(uint64_t Steps)
     {
-        for (uint64_t k=0;k<Steps;k++)
+        for (uint64_t k = 0; k < Steps; k++)
         {
-            CreateBoundaryParticles(Population,BoundaryParticles,Time,Par);
+            CreateBoundaryParticles(Population, BoundaryParticles, Time, Par);
             AllParticles.clear();
-            AllParticles.insert(AllParticles.end(),Population.begin(),Population.end());
-            AllParticles.insert(AllParticles.end(),BoundaryParticles.begin(),BoundaryParticles.end());
+            AllParticles.insert(AllParticles.end(), Population.begin(), Population.end());
+            AllParticles.insert(AllParticles.end(), BoundaryParticles.begin(), BoundaryParticles.end());
             Grid->Build(AllParticles);
-            CalculateTotalForce(Population,BoundaryParticles,*Grid,Par);
-            const double NextTime=Time+Par.TimeStep;
-            for (auto& P:Population)
+            CalculateTotalForce(Population, BoundaryParticles, *Grid, Par);
+            const double NextTime = Time + Par.TimeStep;
+            for (auto& P : Population)
             {
-                P.Velocity.X+=Par.TimeStep*P.Acceleration.X;
-                P.Velocity.Y+=Par.TimeStep*P.Acceleration.Y;
-                P.Velocity.Z+=Par.TimeStep*P.Acceleration.Z;
-                P.Density+=Par.TimeStep*P.DensityRate;
-                P.Density=max(0.95*Par.ReferenceDensity,min(1.05*Par.ReferenceDensity,P.Density));
-                P.Position.X+=Par.TimeStep*(P.Velocity.X+P.XSPH.X);
-                P.Position.Y+=Par.TimeStep*(P.Velocity.Y+P.XSPH.Y);
-                P.Position.Z+=Par.TimeStep*(P.Velocity.Z+P.XSPH.Z);
-                ReflectParticle(P,NextTime,Par);
-                P.Pressure=GetPressure(P.Density,Par);
-                if (!isfinite(P.Density) || !isfinite(P.Pressure) ||
-                    !isfinite(P.Velocity.X) || !isfinite(P.Velocity.Y) ||
-                    !isfinite(P.Velocity.Z))
+                P.Velocity.X += Par.TimeStep * P.Acceleration.X;
+                P.Velocity.Y += Par.TimeStep * P.Acceleration.Y;
+                P.Velocity.Z += Par.TimeStep * P.Acceleration.Z;
+                P.Density += Par.TimeStep * P.DensityRate;
+                P.Density = max(0.95 * Par.ReferenceDensity, min(1.05 * Par.ReferenceDensity, P.Density));
+                P.Position.X += Par.TimeStep * (P.Velocity.X + P.XSPH.X);
+                P.Position.Y += Par.TimeStep * (P.Velocity.Y + P.XSPH.Y);
+                P.Position.Z += Par.TimeStep * (P.Velocity.Z + P.XSPH.Z);
+                ReflectParticle(P, NextTime, Par);
+                P.Pressure = GetPressure(P.Density, Par);
+                //An external force is applied for one timestep only.
+                //Additional AddPropulsion calls before Step() accumulate.
+                P.ExternalForce = {};
+                if (!isfinite(P.Density) || !isfinite(P.Pressure) || !isfinite(P.Velocity.X) || !isfinite(P.Velocity.Y) || !isfinite(P.Velocity.Z))
                     throw runtime_error("Invalid particle state at step " + to_string(Iteration));
             }
-            Time=NextTime;
+            Time = NextTime;
             Iteration++;
-            if (Par.WriteFiles && Par.SaveEveryTime>0.0 &&
-                Time >= NextSave-0.5*Par.TimeStep)
-            {
-                //Iteration stored as integer string; SaveParticles originally
-                //takes int, so use an explicit wide-ID serialization here.
-                for (const Particle& P:Population)
-                    SFile << Iteration << "," << Time << "," << P.ID << "," <<
-                        P.Position.X << "," << P.Position.Y << "," << P.Position.Z << "," <<
-                        P.Velocity.X << "," << P.Velocity.Y << "," << P.Velocity.Z << "," <<
-                        P.Density << "," << P.Pressure << "\n";
-                NextSave+=Par.SaveEveryTime;
-            }
+
         }
     }
 
@@ -1007,7 +946,7 @@ struct WaveTank
     vector<MapVector> VelocityMap()
     {
         Grid->Build(Population);
-        return outputMap(Population,*Grid);
+        return outputMap(Population, *Grid);
     }
 };
 WT_API const char* WT_LastError()
@@ -1019,20 +958,20 @@ WT_API void* WT_Create(const WT_Config* C)
     try
     {
         if (!C) throw runtime_error("Null config");
-        auto Result=make_unique<WaveTank>(*C);
+        auto Result = make_unique<WaveTank>(*C);
         WT_ErrorMessage.clear();
         return Result.release();
     }
-    catch(const exception& E)
+    catch (const exception& E)
     {
-        WT_ErrorMessage=E.what(); return nullptr;
+        WT_ErrorMessage = E.what(); return nullptr;
     }
 }
 WT_API void WT_Destroy(void* H)
 {
     delete static_cast<WaveTank*>(H);
 }
-WT_API int WT_Step(void* H,uint64_t Steps)
+WT_API int WT_Step(void* H, uint64_t Steps)
 {
     try
     {
@@ -1041,80 +980,101 @@ WT_API int WT_Step(void* H,uint64_t Steps)
         WT_ErrorMessage.clear();
         return 0;
     }
-    catch(const exception& E) { WT_ErrorMessage=E.what(); return -1; }
+    catch (const exception& E)
+    {
+        WT_ErrorMessage = E.what(); return -1;
+    }
 }
-WT_API int64_t WT_GetMap(void* H,WT_MapRow* Rows,uint64_t Capacity)
+WT_API int64_t WT_GetMap(void* H, WT_MapRow* Rows, uint64_t Capacity)
 {
     try
     {
         if (!H) throw runtime_error("Null simulation handle");
-        auto Map=static_cast<WaveTank*>(H)->VelocityMap();
+        auto Map = static_cast<WaveTank*>(H)->VelocityMap();
         if (Rows && Capacity < Map.size()) throw runtime_error("Map buffer too small");
         if (Rows)
-            for (size_t i=0;i<Map.size();i++)
+            for (size_t i = 0; i < Map.size(); i++)
             {
-                const auto& M=Map[i];
-                Rows[i]={M.Position.X,M.Position.Y,M.Position.Z,
-                         M.Velocity.X,M.Velocity.Y,M.Velocity.Z,M.ParticleCount};
+                const auto& M = Map[i];
+                Rows[i] = { M.Position.X,M.Position.Y,M.Position.Z, M.Velocity.X,M.Velocity.Y,M.Velocity.Z,M.ParticleCount };
             }
         WT_ErrorMessage.clear();
         return (int64_t)Map.size();
     }
-    catch(const exception& E)
+    catch (const exception& E)
     {
-        WT_ErrorMessage=E.what(); return -1;
+        WT_ErrorMessage = E.what(); return -1;
     }
 }
-WT_API int64_t WT_GetParticles(void* H,WT_ParticleRow* Rows,uint64_t Capacity)
+WT_API int64_t WT_GetParticles(void* H, WT_ParticleRow* Rows, uint64_t Capacity)
 {
     try
     {
         if (!H) throw runtime_error("Null simulation handle");
-        const auto& Pop=static_cast<WaveTank*>(H)->Population;
-        if (Rows && Capacity<Pop.size()) throw runtime_error("Particle buffer too small");
+        const auto& Pop = static_cast<WaveTank*>(H)->Population;
+        if (Rows && Capacity < Pop.size()) throw runtime_error("Not enough praticles");
         if (Rows)
-            for(size_t i=0;i<Pop.size();i++)
+            for (size_t i = 0; i < Pop.size(); i++)
             {
-                const auto& P=Pop[i];
-                Rows[i]={P.ID,P.Position.X,P.Position.Y,P.Position.Z,P.Velocity.X,P.Velocity.Y,P.Velocity.Z,P.Density,P.Pressure};
+                const auto& P = Pop[i];
+                Rows[i] = { P.ID,P.Position.X,P.Position.Y,P.Position.Z,P.Velocity.X,P.Velocity.Y,P.Velocity.Z,P.Density,P.Pressure };
             }
         WT_ErrorMessage.clear();
         return (int64_t)Pop.size();
     }
-    catch(const exception& E)
+    catch (const exception& E)
     {
-        WT_ErrorMessage=E.what(); return -1;
+        WT_ErrorMessage = E.what(); return -1;
     }
 }
-WT_API int WT_GetInfo(void* H,WT_Info* Info)
+WT_API int WT_GetInfo(void* H, WT_Info* Info)
 {
-    if (!H || !Info) { WT_ErrorMessage="Invalid handle/info"; return -1; }
-    const WaveTank& S=*static_cast<WaveTank*>(H);
-    *Info={S.Iteration,S.Time,S.Par.ParticleSpacing,S.Par.SmoothingLength,S.Par.ParticleMass};
+    if (!H || !Info)
+    {
+        WT_ErrorMessage = "Invalid handle/info"; return -1;
+    }
+    const WaveTank& S = *static_cast<WaveTank*>(H);
+    *Info = { S.Iteration,S.Time,S.Par.ParticleSpacing,S.Par.SmoothingLength,S.Par.ParticleMass };
     WT_ErrorMessage.clear();
     return 0;
 }
-WT_API int WT_SetPistonState(void* H,double Position,double Velocity)
+WT_API int WT_SetPistonState(void* H, double Position, double Velocity)
 {//Checks and pistion motion
     try
     {
         if (!H) throw runtime_error("Null simulation handle");
-        WaveTank& S=*static_cast<WaveTank*>(H);
-        const parameters& P=S.Par;
-        if (!isfinite(Position) || !isfinite(Velocity) || Position <= P.MinDimmensions.X || Position >= P.RampStartX || Position >= P.UnderwaterPillar.X-P.UnderwaterPillar.Radius)
+        WaveTank& S = *static_cast<WaveTank*>(H);
+        const parameters& P = S.Par;
+        if (!isfinite(Position) || !isfinite(Velocity) || Position <= P.MinDimmensions.X || Position >= P.RampStartX || Position >= P.UnderwaterPillar.X - P.UnderwaterPillar.Radius)
             throw runtime_error("Custom piston position outside safe flume range");
-        S.Par.UseCustomPiston=true;
-        S.Par.CustomPistonPosition=Position;
-        S.Par.CustomPistonVelocity=Velocity;
+        S.Par.UseCustomPiston = true;
+        S.Par.CustomPistonPosition = Position;
+        S.Par.CustomPistonVelocity = Velocity;
         WT_ErrorMessage.clear();
         return 0;
     }
-    catch(const exception& E) { WT_ErrorMessage=E.what(); return -1; }
+    catch (const exception& E) { WT_ErrorMessage = E.what(); return -1; }
+}
+WT_API int WT_AddPropulsion(void* H, double PX, double PY, double PZ, double FX, double FY, double FZ)
+{//Apply a specified force to each fluid particle in the selected hash cell
+    try
+    {
+        if (!H) throw runtime_error("Null simulation handle");
+        WaveTank& S = *static_cast<WaveTank*>(H);
+        int Count = S.ApplyPropulsion({ PX, PY, PZ }, { FX, FY, FZ });
+        WT_ErrorMessage.clear();
+        return Count;
+    }
+    catch (const exception& E)
+    {
+        WT_ErrorMessage = E.what();
+        return -1;
+    }
 }
 WT_API int WT_UseSinusoidalPiston(void* H)
 {//Piston uses a sin wave
-    if (!H) { WT_ErrorMessage="Null simulation handle"; return -1; }
-    static_cast<WaveTank*>(H)->Par.UseCustomPiston=false;
+    if (!H) { WT_ErrorMessage = "Null simulation handle"; return -1; }
+    static_cast<WaveTank*>(H)->Par.UseCustomPiston = false;
     WT_ErrorMessage.clear();
     return 0;
 }

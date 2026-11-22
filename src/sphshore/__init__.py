@@ -10,5 +10,5 @@ Example
 """
 from .simulation import Parameters, WaveTank
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 __all__ = ["Parameters", "WaveTank", "__version__"]
