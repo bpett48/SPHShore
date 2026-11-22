@@ -1,149 +1,150 @@
 # SPHShore
 
-**SPHShore** is an early-stage, C++17-accelerated Python package for simulating water waves in a three-dimensional smoothed particle hydrodynamics (SPH) tank. It retains the original wave-tank solver, with a moving piston wavemaker, an inclined shoreline and two fixed vertical pillars (one submerged, one extending above the still-water level).
-## Install locally
+SPHShore is a Python library for simulating water movement in a three-dimensional tank. It uses C++ to perform the calculations and Python to control the simulation.
 
-Python 3.10+ and a C++17 compiler are required when building from source. On Windows, install Visual Studio Build Tools with the C++ workload; on Linux/macOS use a suitable C++ compiler.
+The simulation includes a moving piston that creates waves, a sloping shoreline and two cylindrical pillars. All of which interact with the water.
 
-```bash
-python -m pip install .
-```
+This is for use of a third year project at university, things might still by buggy.
 
-For development:
+## Installation
 
-```bash
-python -m pip install -e '.[dev]'
-python -m pytest -q
-```
-
-Once a release is actually uploaded to PyPI and wheels are built for your platform, the installation command will be:
+Install SPHShore using pip:
 
 ```bash
-python -m pip install SPHShore
+pip install SPHShore
 ```
 
-**Do not assume the PyPI command works until the owner has published a release.**
+The library requires Python and NumPy. The simulation calculations are performed by a compiled C++ solver.
 
-## Quick start
+## What can SPHShore do?
+
+This library can:
+
+- **Create waves:** Use a moving piston to generate waves in the tank.
+- **Change the tank size:** Set the tank dimensions in Python. The shoreline, pillars and piston are scaled to match.
+- **Choose the number of particles:** Control how many particles are used to represent the water.
+- **Control simulation speed:** Set the timestep and number of iterations.
+- **Apply forces:** Add a force to a selected region of water using the spatial hashing grid.
+- **View water movement:** Retrieve the average velocity of the particles in each occupied grid cell.
+- **Access individual particles:** Retrieve the position and velocity of every water particle.
+
+## Creating a simulation
+
+Starting bits:
 
 ```python
 import sphshore
 
-config = sphshore.Parameters(
-    MaxDimmensions=(1.20, 0.45, 0.30),
+Par = sphshore.Parameters(
     N=1200,
     TimeStep=0.00005,
-    MapEveryIterations=50,
-    WriteFiles=False,
+    MaxDimmensions=(1.20, 0.45, 0.30)
 )
 
-with sphshore.WaveTank(config) as tank:
-    for iteration, time, velocity_map in tank.run_maps(200):
-        print(iteration, time, velocity_map.shape)
-    positions = tank.positions()   # shape (N, 3), metres
-    velocities = tank.velocities() # shape (N, 3), metres/s
-    particles = tank.particles()   # shape (N, 9)
+with sphshore.WaveTank(Par) as Tank:
+    Tank.step(100)
+
+    Positions = Tank.positions()
+    Velocities = Tank.velocities()
+
+    print(Positions)
+    print(Velocities)
 ```
 
-### Velocity map
+`N` sets the number of particles, `TimeStep` controls the time between calculations, and `MaxDimmensions` sets the size of the tank in metres. There is no max number of iterations. 
 
-`outputMap()` or `velocity_map()` uses the C++ spatial hashing grid and returns an `(M, 7)` `float64` NumPy array with columns:
+## Adding propulsion
 
-| 0 | 1 | 2 | 3 | 4 | 5 | 6 |
+You can add force to a specific point. This force is distributed between the particles at this area.
+
+```python
+import sphshore
+
+Par = sphshore.Parameters(
+    N=1200,
+    TimeStep=0.00005
+)
+
+with sphshore.WaveTank(Par) as Tank:
+
+    Map = Tank.outputMap()
+
+    #Choose an occupied cell
+    Position = Map[0, :3]
+
+    #Apply a total force of 0.01 N in the X direction
+    Count = Tank.add_propulsion(
+        Position,
+        (0.01, 0.0, 0.0)
+    )
+
+    print("Particles affected:", Count)
+
+    Tank.step(1)
+```
+The force is applied to the next timestep. To apply continuous propulsion, call "add_propulsion()" before each timestep.
+
+## Getting simulation information
+
+You can get information about the simulation in two ways:
+
+### 1. Velocity map
+
+```python
+Map = Tank.outputMap()
+```
+This gives you the location and average particle velocity for each cell
+
+Each row contains:
+
+| X | Y | Z | VX | VY | VZ | Particle count |
 |---|---|---|---|---|---|---|
-| x | y | z | vx | vy | vz | particle count |
 
-Cell positions are in metres and average velocities in metres per second. The map includes only **occupied** cells. It is produced on demand and held in memory; no files are needed.
+This is the quicker way.
 
-### Fluid particles
-
-`particles()` returns an `(N, 9)` `float64` array:
-
-`id, x, y, z, vx, vy, vz, density, pressure`.
-
-`positions()` and `velocities()` return copies with three columns each.
-
-### Adjustable parameters
-
-| Python parameter | Meaning |
-|---|---|
-| `MaxDimmensions=(L,W,H)` | Dimensions in metres; rescales the shoreline, water depth and both pillars |
-| `MinDimmensions=(x,y,z)` | Tank origin |
-| `N` | Number of water particles |
-| `TimeStep` | Solver integration timestep in seconds, checked against a CFL bound |
-| `MapEveryIterations` | Python-side interval between successive returned velocity maps |
-| `PistonBaseX` | Piston neutral X-position (metres); `None` means a scale-dependent default |
-| `PistonAmplitude` | Piston oscillation amplitude (metres); `None` means a scale-dependent default |
-| `WaveFrequency` | Sinusoidal piston frequency, in Hz |
-| `WaveStartTime` | Piston start, in simulated seconds |
-| `WaveRampTime` | Smooth piston startup duration |
-| `WriteFiles` | Opt-in CSV log and configuration output; default `False` |
-| `SaveEveryTime` | Simulated seconds between log snapshots when writing files |
-
-Changing all three dimensions by the same factor preserves geometric similarity. For unequal X, Y and Z scaling, horizontal pillar cross sections stay circular; the ramp slope adjusts accordingly. Changing the tank scale does *not* automatically tune the timestep, wave period or numerical stability parameters.
-
-### Arbitrary run length
-
-The C++ library has no fixed total-iteration cutoff. Python controls stepping:
+### 2. Individual particles
 
 ```python
-with sphshore.WaveTank(config) as tank:
-    for _ in range(100):
-        tank.step(100)
+Positions = Tank.positions()
+Velocities = Tank.velocities()
 ```
 
-Calls to `step()` accept a nonnegative 64-bit integer count. The cumulative counter is also finite (`uint64_t`); practical limits include time, memory and numerical stability.
+`positions()` returns the X, Y and Z coordinates of every particle.
 
-### Custom piston motion
+`velocities()` returns the X, Y and Z velocity components of every particle.
+
+You can also use:
 
 ```python
-with sphshore.WaveTank(config) as tank:
-    for _ in range(100):
-        t = tank.time
-        tank.set_piston_state(position=0.03, velocity=0.0)
-        tank.step(1)
-    tank.use_sinusoidal_piston()
+Particles = Tank.particles()
 ```
 
-Change the custom state before every individual timestep for non-constant motion. The position must stay within the safe flume region.
+This gives a list of all the particles and their properties, might be quicker idk.
 
-### No disk output
+## Controlling the piston
 
-`WriteFiles=False` (default) means no `LogBook.txt` or `SimulationConfig.txt` is created by the solver. All state and maps can be requested as NumPy arrays. When `WriteFiles=True`, the existing CSV schema remains available for the older animation scripts.
+The piston is what creates the waves.
+You can change its frequency, amplitude and starting time through the simulation parameters. 
+You can set attributes directly or have it run on a sin wave.
 
-### AddPropulsion
-
-The original C++ `AddPropulsion` grid helper is retained in the solver source, but **not invoked or exposed** in this release, respecting the earlier request to keep it unused.
-
-## Building packages for distribution
-
-```bash
-python -m pip install build
-python -m build
+```python
+Tank.set_piston_state(0.032, 0.02)
 ```
 
-The output is placed in `dist/`. A platform-specific wheel requires a matching OS/Python/architecture; GitHub Actions uses `cibuildwheel` to produce supported wheels and run tests.
+To return to the automatic wavemaker:
 
-### Release checklist
+```python
+Tank.use_sinusoidal_piston()
+```
 
-1. **Review the MIT licence and owner/author attribution**, and verify rights to all included code.
-2. Put this directory into a GitHub repository you control.
-3. Enable CI and review/test cross-platform wheels.
-4. Create a PyPI account, verify ownership of the desired **SPHShore** project name, and configure a **Trusted Publisher** for the repository and `.github/workflows/release.yml` (environment `pypi`).
-5. Update the version in `pyproject.toml` and `src/sphshore/__init__.py` before each release.
-6. Create a GitHub Release; the release workflow builds wheels and source distribution, then requests publishing through PyPI Trusted Publishing.
-7. Verify `python -m pip install SPHShore` in a fresh environment.
+## How the simulation works
 
-No GitHub repository or PyPI project is created automatically by this source code. Publishing requires the owner's account authorization and review.
+SPHShore uses a smooth particle hydrodynamic model (SPH), specifically using a 3d spline kernel.
+The fluid is represented using a large number of particles, each of which respond to the environment and each other.
+The simulation uses a spatial hashing function to make things faster and transfer information.
+The simulation uses spatial hashing to find nearby particles more efficiently.
+All of the heavy lifting is done in the c++.
 
-## Scientific and implementation notes
+Email me in event of anything bpett48@gmail.com
 
-- Weakly compressible SPH with a 3D cubic-spline kernel, pressure/viscous terms, density diffusion and spatial hashing.
-- The water is constrained by a sloping rigid bed, moving piston, side walls and two fixed cylindrical obstacles.
-- SPH boundary conditions are approximate; the geometry/solver has not been fully validated against experiments.
-- Python calls a compiled C++ extension built from the existing solver source; it is not a Python rewrite of the physics.
-- Copyright notices on the original source are retained. This package's licence should be approved by all code rights-holders before publication.
 
-## Contributing
-
-Bug reports, benchmark comparisons and reproducible test cases are welcome after a public repository has been created. Include Python version, platform, compiler, timestep and tank geometry for any numerical issue.
